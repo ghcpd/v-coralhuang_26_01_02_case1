@@ -200,3 +200,18 @@ This task evaluates:
 Do **not** “improve” behavior.
 Do **not** “fix” odd edge cases.
 Your job is to **make the code safer to maintain, not smarter**.
+---
+
+## Additional Requirements
+
+### 5. `.gitignore` (MANDATORY)
+
+Create a `.gitignore` file in the repository root that ignores:
+
+* The virtual environment directory (`.venv/`)
+* Common Python artifacts (`__pycache__/`, `*.py[cod]`, `*$py.class`)
+* Pytest cache (`.pytest_cache/`)
+* Editor directories (`.vscode/`, `.idea/`)
+* Distribution/packaging artifacts (`dist/`, `build/`, `*.egg-info/`)
+
+This ensures the virtual environment and temporary files are not tracked in version control.
