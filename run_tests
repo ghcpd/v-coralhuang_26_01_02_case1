@@ -1,0 +1,30 @@
+#!/usr/bin/env python3
+import os, subprocess, sys, venv
+
+ROOT = os.path.dirname(__file__)
+VENV_DIR = os.path.join(ROOT, '.venv')
+PY = sys.executable
+
+def run(cmd, **kw):
+    print(f"$ {' '.join(cmd)}")
+    subprocess.check_call(cmd, **kw)
+
+# create venv if missing
+if not os.path.isdir(VENV_DIR):
+    print('Creating virtual environment in .venv')
+    venv.create(VENV_DIR, with_pip=True)
+
+# pip install pytest
+if os.name == 'nt':
+    pip = os.path.join(VENV_DIR, 'Scripts', 'pip.exe')
+    py = os.path.join(VENV_DIR, 'Scripts', 'python.exe')
+else:
+    pip = os.path.join(VENV_DIR, 'bin', 'pip')
+    py = os.path.join(VENV_DIR, 'bin', 'python')
+
+run([py, '-m', 'pip', 'install', '--upgrade', 'pip'])
+run([pip, 'install', 'pytest', 'pytest-asyncio'])
+
+# run tests
+run([py, '-m', 'pytest', '-q'], cwd=ROOT)
+print('\nAll tests executed.')

@@ -101,145 +101,196 @@ class Engine:
             x=dict(out); x.pop("_wrap",None); return {"tool":tool_name,"data":x}
         return out
 
-    def run_sync(self, *, ctx: ToolContext, name: str, raw: str) -> ToolResult:
-        self.tr.emit("tool.resolve.start", {"tool_name": name})
-        try: tool=self.reg.get(name)
-        except KeyError:
-            self.tr.emit("tool.resolve.fail", {"tool_name": name})
-            return ToolResult(tool_name=name, ok=False, error_message="unknown_tool")
-        self.tr.emit("tool.resolve.ok", {"tool_name": tool.name})
+    def _parse_and_coerce(self, *, name: str, raw: str, tool: FunctionTool | None = None):
+        """Resolve JSON args and coerce them according to the tool schema.
 
-        self.tr.emit("args.parse.start", {"tool_name": tool.name})
+        Returns (tool, args) on success or a ToolResult on failure.
+        """
+        # tool may be None when resolution hasn't happened yet
         try:
             p = json.loads(raw) if raw.strip() else {}
-            if not isinstance(p,dict): raise ValueError("args_not_object")
-            a = self._coerce(tool,p)
+            if not isinstance(p, dict):
+                raise ValueError("args_not_object")
+            if tool is not None:
+                a = self._coerce(tool, p)
+            else:
+                a = p
         except Exception as e:
-            self.tr.emit("args.parse.fail", {"tool_name": tool.name, "err": str(e)})
-            return ToolResult(tool_name=tool.name, ok=False, error_message=f"bad_args:{e}")
-        self.tr.emit("args.parse.ok", {"tool_name": tool.name, "keys": sorted(a.keys())})
+            # preserve exact trace payloads and error string formatting
+            if tool is not None:
+                self.tr.emit("args.parse.fail", {"tool_name": tool.name, "err": str(e)})
+                return ToolResult(tool_name=tool.name, ok=False, error_message=f"bad_args:{e}")
+            else:
+                self.tr.emit("args.parse.fail", {"tool_name": name, "err": str(e)})
+                return ToolResult(tool_name=name, ok=False, error_message=f"bad_args:{e}")
+        if tool is not None:
+            self.tr.emit("args.parse.ok", {"tool_name": tool.name, "keys": sorted(a.keys())})
+        else:
+            self.tr.emit("args.parse.ok", {"tool_name": name, "keys": sorted(a.keys())})
+        return (tool, a)
 
+    def _check_cache(self, tool: FunctionTool, raw: str):
         if self.cfg.enable_cache:
-            ck=(tool.name, raw)
+            ck = (tool.name, raw)
             if ck in self.cache:
                 self.tr.emit("cache.hit", {"tool_name": tool.name})
                 return ToolResult(tool_name=tool.name, ok=True, output=self.cache[ck], cached=True)
             self.tr.emit("cache.miss", {"tool_name": tool.name})
+        return None
 
+    def _run_guardrails_in(self, ctx: ToolContext, tool: FunctionTool, a: dict[str, Any]):
         self.tr.emit("guard.input.start", {"tool_name": tool.name})
         try:
-            for g in self.in_g: g(ctx, tool.name, a)
+            for g in self.in_g:
+                g(ctx, tool.name, a)
         except GuardrailError as e:
             self.tr.emit("guard.input.block", {"tool_name": tool.name, "reason": str(e)})
             return ToolResult(tool_name=tool.name, ok=False, error_message=f"guardrail:{e}")
         self.tr.emit("guard.input.ok", {"tool_name": tool.name})
+        return None
 
-        attempts=0; last=None
+    def _run_guardrails_out(self, ctx: ToolContext, tool: FunctionTool, n: Any, attempts: int):
+        self.tr.emit("guard.output.start", {"tool_name": tool.name})
+        try:
+            for g in self.out_g:
+                g(ctx, tool.name, n)
+        except GuardrailError as e:
+            self.tr.emit("guard.output.block", {"tool_name": tool.name, "reason": str(e)})
+            return ToolResult(tool_name=tool.name, ok=False, error_message=f"guardrail:{e}", attempts=attempts)
+        self.tr.emit("guard.output.ok", {"tool_name": tool.name})
+        return None
+
+    def _finalize_and_store_cache(self, tool: FunctionTool, raw: str, n: Any, attempts: int) -> ToolResult:
+        if self.cfg.enable_cache:
+            self.cache[(tool.name, raw)] = n
+            self.tr.emit("cache.store", {"tool_name": tool.name})
+        return ToolResult(tool_name=tool.name, ok=True, output=n, attempts=attempts)
+
+    def _invoke_sync(self, ctx: ToolContext, tool: FunctionTool, a: dict[str, Any]):
+        """Invoke a synchronous tool (may still wrap coro via FunctionTool.s).
+
+        Returns (success, out_or_error_message, attempts, is_user_error)
+        """
+        attempts = 0
+        last = None
         self.tr.emit("tool.invoke.start", {"tool_name": tool.name})
         while attempts <= self.cfg.max_retries:
             attempts += 1
             try:
                 out = tool.s(ctx, **a)
-                last=None; break
+                last = None
+                return True, out, attempts, False
             except ValueError as e:
                 self.tr.emit("tool.invoke.user_error", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
-                return ToolResult(tool_name=tool.name, ok=False, error_message=f"user_error:{e}", attempts=attempts)
+                return False, f"user_error:{e}", attempts, True
             except RetryableToolError as e:
                 self.tr.emit("tool.invoke.retryable", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
-                last=f"tool_error:{e}"
-                if attempts > self.cfg.max_retries: break
+                last = f"tool_error:{e}"
+                if attempts > self.cfg.max_retries:
+                    break
             except Exception as e:
                 self.tr.emit("tool.invoke.fail", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
-                return ToolResult(tool_name=tool.name, ok=False, error_message=f"tool_error:{e}", attempts=attempts)
+                return False, f"tool_error:{e}", attempts, False
         if last is not None:
-            return ToolResult(tool_name=tool.name, ok=False, error_message=last, attempts=attempts)
-        self.tr.emit("tool.invoke.ok", {"tool_name": tool.name, "attempts": attempts})
+            return False, last, attempts, False
+        return False, "tool_error:unknown", attempts, False
 
-        n = self._norm(tool.name, out, raw)
+    async def _invoke_async(self, ctx: ToolContext, tool: FunctionTool, a: dict[str, Any]):
+        attempts = 0
+        last = None
+        self.tr.emit("tool.invoke.start", {"tool_name": tool.name})
+        while attempts <= self.cfg.max_retries:
+            attempts += 1
+            try:
+                out = await asyncio.wait_for(tool.a(ctx, **a), timeout=self.cfg.async_timeout_s)
+                last = None
+                return True, out, attempts, False
+            except asyncio.TimeoutError:
+                self.tr.emit("tool.invoke.timeout", {"tool_name": tool.name, "attempt": attempts})
+                return False, "tool_error:timeout", attempts, False
+            except ValueError as e:
+                self.tr.emit("tool.invoke.user_error", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
+                return False, f"user_error:{e}", attempts, True
+            except RetryableToolError as e:
+                self.tr.emit("tool.invoke.retryable", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
+                last = f"tool_error:{e}"
+                if attempts > self.cfg.max_retries:
+                    break
+            except Exception as e:
+                self.tr.emit("tool.invoke.fail", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
+                return False, f"tool_error:{e}", attempts, False
+        if last is not None:
+            return False, last, attempts, False
+        return False, "tool_error:unknown", attempts, False
 
-        self.tr.emit("guard.output.start", {"tool_name": tool.name})
-        try:
-            for g in self.out_g: g(ctx, tool.name, n)
-        except GuardrailError as e:
-            self.tr.emit("guard.output.block", {"tool_name": tool.name, "reason": str(e)})
-            return ToolResult(tool_name=tool.name, ok=False, error_message=f"guardrail:{e}", attempts=attempts)
-        self.tr.emit("guard.output.ok", {"tool_name": tool.name})
-
-        if self.cfg.enable_cache:
-            self.cache[(tool.name, raw)] = n
-            self.tr.emit("cache.store", {"tool_name": tool.name})
-
-        return ToolResult(tool_name=tool.name, ok=True, output=n, attempts=attempts)
-
-    async def run_async(self, *, ctx: ToolContext, name: str, raw: str) -> ToolResult:
+    def run_sync(self, *, ctx: ToolContext, name: str, raw: str) -> ToolResult:
         self.tr.emit("tool.resolve.start", {"tool_name": name})
-        try: tool=self.reg.get(name)
+        try:
+            tool = self.reg.get(name)
         except KeyError:
             self.tr.emit("tool.resolve.fail", {"tool_name": name})
             return ToolResult(tool_name=name, ok=False, error_message="unknown_tool")
         self.tr.emit("tool.resolve.ok", {"tool_name": tool.name})
 
         self.tr.emit("args.parse.start", {"tool_name": tool.name})
-        try:
-            p = json.loads(raw) if raw.strip() else {}
-            if not isinstance(p,dict): raise ValueError("args_not_object")
-            a = self._coerce(tool,p)
-        except Exception as e:
-            self.tr.emit("args.parse.fail", {"tool_name": tool.name, "err": str(e)})
-            return ToolResult(tool_name=tool.name, ok=False, error_message=f"bad_args:{e}")
-        self.tr.emit("args.parse.ok", {"tool_name": tool.name, "keys": sorted(a.keys())})
+        parsed = self._parse_and_coerce(name=name, raw=raw, tool=tool)
+        if isinstance(parsed, ToolResult):
+            return parsed
+        _, a = parsed
 
-        if self.cfg.enable_cache:
-            ck=(tool.name, raw)
-            if ck in self.cache:
-                self.tr.emit("cache.hit", {"tool_name": tool.name})
-                return ToolResult(tool_name=tool.name, ok=True, output=self.cache[ck], cached=True)
-            self.tr.emit("cache.miss", {"tool_name": tool.name})
+        cached = self._check_cache(tool, raw)
+        if cached is not None:
+            return cached
 
-        self.tr.emit("guard.input.start", {"tool_name": tool.name})
-        try:
-            for g in self.in_g: g(ctx, tool.name, a)
-        except GuardrailError as e:
-            self.tr.emit("guard.input.block", {"tool_name": tool.name, "reason": str(e)})
-            return ToolResult(tool_name=tool.name, ok=False, error_message=f"guardrail:{e}")
-        self.tr.emit("guard.input.ok", {"tool_name": tool.name})
+        guard_in = self._run_guardrails_in(ctx, tool, a)
+        if isinstance(guard_in, ToolResult):
+            return guard_in
 
-        attempts=0; last=None
-        self.tr.emit("tool.invoke.start", {"tool_name": tool.name})
-        while attempts <= self.cfg.max_retries:
-            attempts += 1
-            try:
-                out = await asyncio.wait_for(tool.a(ctx, **a), timeout=self.cfg.async_timeout_s)
-                last=None; break
-            except asyncio.TimeoutError:
-                self.tr.emit("tool.invoke.timeout", {"tool_name": tool.name, "attempt": attempts})
-                return ToolResult(tool_name=tool.name, ok=False, error_message="tool_error:timeout", attempts=attempts)
-            except ValueError as e:
-                self.tr.emit("tool.invoke.user_error", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
-                return ToolResult(tool_name=tool.name, ok=False, error_message=f"user_error:{e}", attempts=attempts)
-            except RetryableToolError as e:
-                self.tr.emit("tool.invoke.retryable", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
-                last=f"tool_error:{e}"
-                if attempts > self.cfg.max_retries: break
-            except Exception as e:
-                self.tr.emit("tool.invoke.fail", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
-                return ToolResult(tool_name=tool.name, ok=False, error_message=f"tool_error:{e}", attempts=attempts)
-        if last is not None:
-            return ToolResult(tool_name=tool.name, ok=False, error_message=last, attempts=attempts)
+        ok, out_or_err, attempts, is_user_err = self._invoke_sync(ctx, tool, a)
+        if not ok:
+            return ToolResult(tool_name=tool.name, ok=False, error_message=out_or_err, attempts=attempts)
         self.tr.emit("tool.invoke.ok", {"tool_name": tool.name, "attempts": attempts})
 
-        n = self._norm(tool.name, out, raw)
+        n = self._norm(tool.name, out_or_err, raw)
 
-        self.tr.emit("guard.output.start", {"tool_name": tool.name})
+        guard_out = self._run_guardrails_out(ctx, tool, n, attempts)
+        if isinstance(guard_out, ToolResult):
+            return guard_out
+
+        return self._finalize_and_store_cache(tool, raw, n, attempts)
+
+    async def run_async(self, *, ctx: ToolContext, name: str, raw: str) -> ToolResult:
+        self.tr.emit("tool.resolve.start", {"tool_name": name})
         try:
-            for g in self.out_g: g(ctx, tool.name, n)
-        except GuardrailError as e:
-            self.tr.emit("guard.output.block", {"tool_name": tool.name, "reason": str(e)})
-            return ToolResult(tool_name=tool.name, ok=False, error_message=f"guardrail:{e}", attempts=attempts)
-        self.tr.emit("guard.output.ok", {"tool_name": tool.name})
+            tool = self.reg.get(name)
+        except KeyError:
+            self.tr.emit("tool.resolve.fail", {"tool_name": name})
+            return ToolResult(tool_name=name, ok=False, error_message="unknown_tool")
+        self.tr.emit("tool.resolve.ok", {"tool_name": tool.name})
 
-        if self.cfg.enable_cache:
-            self.cache[(tool.name, raw)] = n
-            self.tr.emit("cache.store", {"tool_name": tool.name})
+        self.tr.emit("args.parse.start", {"tool_name": tool.name})
+        parsed = self._parse_and_coerce(name=name, raw=raw, tool=tool)
+        if isinstance(parsed, ToolResult):
+            return parsed
+        _, a = parsed
 
-        return ToolResult(tool_name=tool.name, ok=True, output=n, attempts=attempts)
+        cached = self._check_cache(tool, raw)
+        if cached is not None:
+            return cached
+
+        guard_in = self._run_guardrails_in(ctx, tool, a)
+        if isinstance(guard_in, ToolResult):
+            return guard_in
+
+        ok, out_or_err, attempts, is_user_err = await self._invoke_async(ctx, tool, a)
+        if not ok:
+            return ToolResult(tool_name=tool.name, ok=False, error_message=out_or_err, attempts=attempts)
+        self.tr.emit("tool.invoke.ok", {"tool_name": tool.name, "attempts": attempts})
+
+        n = self._norm(tool.name, out_or_err, raw)
+
+        guard_out = self._run_guardrails_out(ctx, tool, n, attempts)
+        if isinstance(guard_out, ToolResult):
+            return guard_out
+
+        return self._finalize_and_store_cache(tool, raw, n, attempts)
