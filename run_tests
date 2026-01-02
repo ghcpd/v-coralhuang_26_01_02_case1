@@ -1,0 +1,28 @@
+#!/usr/bin/env python3
+"""Create reproducible venv, install test deps, and run the test suite.
+Usage: ./run_tests
+"""
+import os, subprocess, sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+VENV = ROOT / ".venv"
+PY = VENV / ("Scripts" if os.name == "nt" else "bin") / "python"
+
+def sh(cmd, **kw):
+    print("\n# ", " ".join(cmd))
+    subprocess.check_call(cmd, **kw)
+
+def main():
+    # 1) create venv if missing
+    if not VENV.exists():
+        sh([sys.executable, "-m", "venv", str(VENV)])
+    # 2) ensure pip & pytest
+    sh([str(PY), "-m", "pip", "install", "-q", "--upgrade", "pip"])
+    sh([str(PY), "-m", "pip", "install", "-q", "pytest", "pytest-asyncio"])
+    # 3) run tests
+    sh([str(PY), "-m", "pytest", "-q"], cwd=str(ROOT))
+    print("\nAll tests passed.")
+
+if __name__ == '__main__':
+    main()
