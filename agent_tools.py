@@ -101,9 +101,10 @@ class Engine:
             x=dict(out); x.pop("_wrap",None); return {"tool":tool_name,"data":x}
         return out
 
-    def run_sync(self, *, ctx: ToolContext, name: str, raw: str) -> ToolResult:
+    def _resolve_and_parse(self, name: str, raw: str) -> ToolResult | tuple[FunctionTool, dict[str, Any]]:
         self.tr.emit("tool.resolve.start", {"tool_name": name})
-        try: tool=self.reg.get(name)
+        try:
+            tool = self.reg.get(name)
         except KeyError:
             self.tr.emit("tool.resolve.fail", {"tool_name": name})
             return ToolResult(tool_name=name, ok=False, error_message="unknown_tool")
@@ -112,15 +113,17 @@ class Engine:
         self.tr.emit("args.parse.start", {"tool_name": tool.name})
         try:
             p = json.loads(raw) if raw.strip() else {}
-            if not isinstance(p,dict): raise ValueError("args_not_object")
-            a = self._coerce(tool,p)
+            if not isinstance(p, dict): raise ValueError("args_not_object")
+            a = self._coerce(tool, p)
         except Exception as e:
             self.tr.emit("args.parse.fail", {"tool_name": tool.name, "err": str(e)})
             return ToolResult(tool_name=tool.name, ok=False, error_message=f"bad_args:{e}")
         self.tr.emit("args.parse.ok", {"tool_name": tool.name, "keys": sorted(a.keys())})
+        return tool, a
 
+    async def _run_after_parse(self, tool: FunctionTool, a: dict[str, Any], raw: str, ctx: ToolContext, invoker, is_async: bool) -> ToolResult:
         if self.cfg.enable_cache:
-            ck=(tool.name, raw)
+            ck = (tool.name, raw)
             if ck in self.cache:
                 self.tr.emit("cache.hit", {"tool_name": tool.name})
                 return ToolResult(tool_name=tool.name, ok=True, output=self.cache[ck], cached=True)
@@ -134,26 +137,10 @@ class Engine:
             return ToolResult(tool_name=tool.name, ok=False, error_message=f"guardrail:{e}")
         self.tr.emit("guard.input.ok", {"tool_name": tool.name})
 
-        attempts=0; last=None
-        self.tr.emit("tool.invoke.start", {"tool_name": tool.name})
-        while attempts <= self.cfg.max_retries:
-            attempts += 1
-            try:
-                out = tool.s(ctx, **a)
-                last=None; break
-            except ValueError as e:
-                self.tr.emit("tool.invoke.user_error", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
-                return ToolResult(tool_name=tool.name, ok=False, error_message=f"user_error:{e}", attempts=attempts)
-            except RetryableToolError as e:
-                self.tr.emit("tool.invoke.retryable", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
-                last=f"tool_error:{e}"
-                if attempts > self.cfg.max_retries: break
-            except Exception as e:
-                self.tr.emit("tool.invoke.fail", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
-                return ToolResult(tool_name=tool.name, ok=False, error_message=f"tool_error:{e}", attempts=attempts)
-        if last is not None:
-            return ToolResult(tool_name=tool.name, ok=False, error_message=last, attempts=attempts)
-        self.tr.emit("tool.invoke.ok", {"tool_name": tool.name, "attempts": attempts})
+        result = await self._invoke_with_retry(tool, ctx, a, invoker, is_async)
+        if isinstance(result, ToolResult):
+            return result
+        out, attempts = result
 
         n = self._norm(tool.name, out, raw)
 
@@ -171,46 +158,19 @@ class Engine:
 
         return ToolResult(tool_name=tool.name, ok=True, output=n, attempts=attempts)
 
-    async def run_async(self, *, ctx: ToolContext, name: str, raw: str) -> ToolResult:
-        self.tr.emit("tool.resolve.start", {"tool_name": name})
-        try: tool=self.reg.get(name)
-        except KeyError:
-            self.tr.emit("tool.resolve.fail", {"tool_name": name})
-            return ToolResult(tool_name=name, ok=False, error_message="unknown_tool")
-        self.tr.emit("tool.resolve.ok", {"tool_name": tool.name})
-
-        self.tr.emit("args.parse.start", {"tool_name": tool.name})
-        try:
-            p = json.loads(raw) if raw.strip() else {}
-            if not isinstance(p,dict): raise ValueError("args_not_object")
-            a = self._coerce(tool,p)
-        except Exception as e:
-            self.tr.emit("args.parse.fail", {"tool_name": tool.name, "err": str(e)})
-            return ToolResult(tool_name=tool.name, ok=False, error_message=f"bad_args:{e}")
-        self.tr.emit("args.parse.ok", {"tool_name": tool.name, "keys": sorted(a.keys())})
-
-        if self.cfg.enable_cache:
-            ck=(tool.name, raw)
-            if ck in self.cache:
-                self.tr.emit("cache.hit", {"tool_name": tool.name})
-                return ToolResult(tool_name=tool.name, ok=True, output=self.cache[ck], cached=True)
-            self.tr.emit("cache.miss", {"tool_name": tool.name})
-
-        self.tr.emit("guard.input.start", {"tool_name": tool.name})
-        try:
-            for g in self.in_g: g(ctx, tool.name, a)
-        except GuardrailError as e:
-            self.tr.emit("guard.input.block", {"tool_name": tool.name, "reason": str(e)})
-            return ToolResult(tool_name=tool.name, ok=False, error_message=f"guardrail:{e}")
-        self.tr.emit("guard.input.ok", {"tool_name": tool.name})
-
-        attempts=0; last=None
+    async def _invoke_with_retry(self, tool: FunctionTool, ctx: ToolContext, a: dict[str, Any], invoker, is_async: bool) -> ToolResult | tuple[Any, int]:
+        attempts = 0
+        last = None
         self.tr.emit("tool.invoke.start", {"tool_name": tool.name})
         while attempts <= self.cfg.max_retries:
             attempts += 1
             try:
-                out = await asyncio.wait_for(tool.a(ctx, **a), timeout=self.cfg.async_timeout_s)
-                last=None; break
+                if is_async:
+                    out = await invoker()
+                else:
+                    out = invoker()
+                last = None
+                break
             except asyncio.TimeoutError:
                 self.tr.emit("tool.invoke.timeout", {"tool_name": tool.name, "attempt": attempts})
                 return ToolResult(tool_name=tool.name, ok=False, error_message="tool_error:timeout", attempts=attempts)
@@ -219,7 +179,7 @@ class Engine:
                 return ToolResult(tool_name=tool.name, ok=False, error_message=f"user_error:{e}", attempts=attempts)
             except RetryableToolError as e:
                 self.tr.emit("tool.invoke.retryable", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
-                last=f"tool_error:{e}"
+                last = f"tool_error:{e}"
                 if attempts > self.cfg.max_retries: break
             except Exception as e:
                 self.tr.emit("tool.invoke.fail", {"tool_name": tool.name, "attempt": attempts, "err": str(e)})
@@ -227,19 +187,25 @@ class Engine:
         if last is not None:
             return ToolResult(tool_name=tool.name, ok=False, error_message=last, attempts=attempts)
         self.tr.emit("tool.invoke.ok", {"tool_name": tool.name, "attempts": attempts})
+        return out, attempts
 
-        n = self._norm(tool.name, out, raw)
-
-        self.tr.emit("guard.output.start", {"tool_name": tool.name})
+    def run_sync(self, *, ctx: ToolContext, name: str, raw: str) -> ToolResult:
+        res = self._resolve_and_parse(name, raw)
+        if isinstance(res, ToolResult):
+            return res
+        tool, a = res
+        invoker = lambda: tool.s(ctx, **a)
         try:
-            for g in self.out_g: g(ctx, tool.name, n)
-        except GuardrailError as e:
-            self.tr.emit("guard.output.block", {"tool_name": tool.name, "reason": str(e)})
-            return ToolResult(tool_name=tool.name, ok=False, error_message=f"guardrail:{e}", attempts=attempts)
-        self.tr.emit("guard.output.ok", {"tool_name": tool.name})
+            return asyncio.run(self._run_after_parse(tool, a, raw, ctx, invoker, is_async=False))
+        except RuntimeError as e:
+            if "asyncio.run() cannot be called from a running event loop" in str(e):
+                return ToolResult(tool_name=tool.name, ok=False, error_message=f"tool_error:{e}")
+            raise
 
-        if self.cfg.enable_cache:
-            self.cache[(tool.name, raw)] = n
-            self.tr.emit("cache.store", {"tool_name": tool.name})
-
-        return ToolResult(tool_name=tool.name, ok=True, output=n, attempts=attempts)
+    async def run_async(self, *, ctx: ToolContext, name: str, raw: str) -> ToolResult:
+        res = self._resolve_and_parse(name, raw)
+        if isinstance(res, ToolResult):
+            return res
+        tool, a = res
+        invoker = lambda: asyncio.wait_for(tool.a(ctx, **a), timeout=self.cfg.async_timeout_s)
+        return await self._run_after_parse(tool, a, raw, ctx, invoker, is_async=True)
