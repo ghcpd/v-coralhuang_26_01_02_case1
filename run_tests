@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT_DIR="$(dirname "$0")"
+cd "$ROOT_DIR"
+
+python -m venv .venv
+# prefer the venv pip/python explicitly for determinism
+. .venv/bin/activate
+python -m pip install -U pip
+python -m pip install pytest pytest-asyncio
+python -m pytest -q
