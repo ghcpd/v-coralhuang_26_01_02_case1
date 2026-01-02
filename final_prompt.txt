@@ -1,0 +1,202 @@
+You are working in a local Python repository.
+
+* Core implementation file: `agent_tools.py`
+* Tests: `tests/test_engine.py`
+
+Your task is to perform a **PR-level refactor** of `agent_tools.py`.
+
+The goal is to **remove structural duplication and scattered logic** (especially between `run_sync` and `run_async`), improve readability, and reduce future drift risk — **without changing any observable behavior**.
+
+---
+
+## Hard Requirements (Must All Be Met)
+
+1. **Public API must remain unchanged**
+
+   * `Engine.run_sync(ctx, name, raw)`
+   * `Engine.run_async(ctx, name, raw)`
+   * The semantics of `ToolResult` fields must not change (`ok`, `output`, `error_message`, `attempts`, `cached`).
+
+2. **No new runtime dependencies**
+
+   * Standard library only.
+   * `pytest` is allowed for tests only.
+
+3. **All existing tests must pass**
+
+   * Tests must be green (`pytest -q`).
+   * You must NOT change test assertion semantics to fit your implementation.
+
+4. **You must actually run the tests**
+
+   * Run `pytest -q`.
+   * Iterate based on failures until all tests pass.
+
+5. **You MAY add tests (optional)**
+
+   * Only to *lock existing behavior*.
+   * You must NOT introduce new behavior or change behavior boundaries.
+
+---
+
+## Critical Behavior Invariants (Do NOT Break)
+
+These behaviors are intentionally tricky and reflect real-world edge cases.
+They are locked by tests and must be preserved exactly.
+
+* **Cache key**
+
+  * Cache key is `(tool_name, raw_args_string)` using the *exact raw string*.
+  * Do NOT canonicalize JSON.
+  * Whitespace and key order differences must result in different cache keys.
+
+* **Cache hit short-circuit**
+
+  * On cache hit:
+
+    * Do NOT run input guardrails
+    * Do NOT invoke the tool
+    * Do NOT run output guardrails
+  * After a `cache.hit` trace event, there must be no `guard.*` or `tool.invoke.*` events.
+
+* **Trace payload immutability**
+
+  * `TraceSink.emit()` must copy the payload.
+  * Mutating the original dict after `emit()` must not affect stored trace events.
+
+* **Unknown argument passthrough**
+
+  * Arguments not declared in the schema must be passed through to the tool function unchanged.
+
+* **Nested event loop behavior**
+
+  * If `run_sync` is called while an event loop is already running AND the tool is async:
+
+    * `asyncio.run()` will raise `RuntimeError`
+    * This must be mapped to `tool_error:<message>`
+    * You must NOT change the error category.
+
+* **Error mapping rules**
+
+  * Unknown tool → `"unknown_tool"`
+  * Bad JSON / args parsing / coercion → `"bad_args:<...>"`
+  * `ValueError` from tool invocation → `"user_error:<...>"` (no retry)
+  * `RetryableToolError` → retryable; after retries exhausted → `"tool_error:<...>"`
+  * Async timeout → `"tool_error:timeout"` (no retry)
+  * `GuardrailError` → `"guardrail:<...>"`
+
+* **Execution order must remain stable**
+
+  ```
+  resolve
+  → parse / coerce / defaults
+  → cache check
+  → input guardrails
+  → invoke (retry / timeout)
+  → normalize
+  → output guardrails
+  → cache store
+  ```
+
+---
+
+## What You Should Optimize For
+
+* Eliminate duplicated logic between `run_sync` and `run_async`
+* Centralize:
+
+  * error mapping
+  * retry handling
+  * guardrail execution
+  * trace emission
+* Prefer **clear structure over clever abstraction**
+* Avoid over-engineering
+
+Code length does **not** have to be shorter.
+Clarity, correctness, and resistance to future drift matter more.
+
+---
+
+## Final Deliverables (Updated – Strict)
+
+Your final submission **must include all of the following artifacts**:
+
+### 1. `README.md` (MANDATORY)
+
+All explanatory content must live here.
+
+The README **must include**:
+
+* **Refactor Summary**
+
+  * What structural changes were made
+  * What duplication was removed
+
+* **Design Rationale**
+
+  * How the new structure reduces duplication
+  * How it prevents sync/async behavior drift
+
+* **Behavior Invariants**
+
+  * A list of the most fragile or non-obvious behaviors
+  * How the refactor guarantees they remain unchanged
+
+* **How to Run**
+
+  * Environment setup instructions
+  * How to run tests locally
+
+No summaries or explanations should be provided outside `README.md`.
+
+---
+
+### 2. `run_tests` (MANDATORY)
+
+A single executable script that:
+
+* Sets up a reusable environment (e.g. virtualenv)
+* Installs dependencies
+* Runs the full test suite in one command
+
+Running:
+
+```bash
+./run_tests
+```
+
+must be sufficient to validate the submission.
+
+---
+
+### 3. Reusable Environment (MANDATORY)
+
+* The environment setup must be deterministic and reusable.
+* No manual, undocumented shell steps.
+* No assumptions about preinstalled dependencies beyond Python.
+
+---
+
+### 4. Test Execution Proof (MANDATORY)
+
+In your **final response**, you must include:
+
+* The exact command(s) you executed (at minimum: `./run_tests`)
+* A short confirmation that all tests passed
+
+Do **not** include design summaries or explanations in the response body —
+they must live in `README.md`.
+
+---
+
+## Evaluation Note (For Clarity)
+
+This task evaluates:
+
+* Refactoring skill under strict behavioral constraints
+* Respect for legacy quirks and edge cases
+* Engineering judgment (what *not* to change)
+
+Do **not** “improve” behavior.
+Do **not** “fix” odd edge cases.
+Your job is to **make the code safer to maintain, not smarter**.
