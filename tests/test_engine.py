@@ -19,15 +19,27 @@ def test_cache_key_exact_raw_whitespace_matters():
 def test_cache_hit_short_circuit_no_guards_or_invoke_after_hit():
     calls={"n":0}; t=TraceSink()
     def f(ctx, x:int): calls["n"]+=1; return {"x":x}
-    def bad_guard(ctx, tool, args): raise GuardrailError("nope")
+
+    guard_calls = {"n": 0}
+    def bad_guard(ctx, tool, args):
+        guard_calls["n"] += 1
+        # If guard runs on the second call, it will raise and fail the test.
+        if guard_calls["n"] >= 2:
+            raise GuardrailError("nope")
+
     tool=FunctionTool("t", ToolSpec({"x":"int"}), f)
     e=E([tool], trace=t, cfg=EngineConfig(enable_cache=True), in_g=[bad_guard])
-    e.run_sync(ctx=ToolContext("t2"), name="t", raw='{"x":1}')
+
+    r1 = e.run_sync(ctx=ToolContext("t2"), name="t", raw='{"x":1}')
+    assert r1.ok is True
+
     r2=e.run_sync(ctx=ToolContext("t2"), name="t", raw='{"x":1}')
     assert r2.cached and r2.attempts==0 and calls["n"]==1
+
     names=[ev.name for ev in t.events]
     hit=max(i for i,n in enumerate(names) if n=="cache.hit")
     assert all(n not in ("guard.input.start","tool.invoke.start","guard.output.start") for n in names[hit+1:])
+
 
 def test_unknown_args_passthrough():
     def f(ctx, x:int, **kw): return {"x":x,"extra":kw.get("extra")}
